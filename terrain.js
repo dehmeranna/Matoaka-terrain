@@ -169,22 +169,55 @@ function travelTimes(edges, startId, maxSeconds, personalSpeed = 1) {
 
 // Score every cell by how likely the person is to be there after
 // elapsedS seconds. Scores add up to 1.
+//
+// Two models:
+//   "wander" (default): people meander, stop and double back, so the
+//     likeliest place is near where they were last seen and the chance
+//     fades with travel time. The typical travel time grows with the
+//     square root of elapsed time, scaled by wanderScale, and the chance
+//     falls off exponentially with travel time beyond that.
+//   "walkAway": people keep walking, so the likeliest places form a band
+//     at about movingShare of the farthest they could have gone.
+// Both are starting assumptions to tune against real tracks.
 function predict({ edges, rows, startId, elapsedS, personalSpeed = 1,
-                   landPreference = {}, movingShare = 0.7, spread = 0.25 }) {
-  const times = travelTimes(edges, startId, elapsedS, personalSpeed);
+                   landPreference = {}, model = "wander", wanderScale = 3,
+                   movingShare = 0.7, spread = 0.25, times = null }) {
+  if (!times) times = travelTimes(edges, startId, elapsedS, personalSpeed);
   const land = new Array(edges.cellCount);
   for (const r of rows) land[cellId(r)] = LAND_NAMES[r.MAJORITY];
   const scores = new Float64Array(edges.cellCount);
+  const tau = wanderScale * Math.sqrt(elapsedS);
   let total = 0;
   for (let id = 0; id < edges.cellCount; id++) {
     const t = times[id];
-    if (!Number.isFinite(t)) continue;
-    const z = (t / elapsedS - movingShare) / spread;
-    const score = Math.exp(-z * z) * (landPreference[land[id]] ?? 1);
+    if (!Number.isFinite(t) || t > elapsedS) continue;
+    let score;
+    if (model === "walkAway") {
+      const z = (t / elapsedS - movingShare) / spread;
+      score = Math.exp(-z * z);
+    } else {
+      score = Math.exp(-t / tau);
+    }
+    score *= landPreference[land[id]] ?? 1;
     scores[id] = score;
     total += score;
   }
   return total > 0 ? scores.map((s) => s / total) : scores;
+}
+
+// Read a plain comma-separated file with a header row and numeric
+// values (like weights.csv) without any library. Blank values -> null.
+function readCsv(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim() !== "");
+  const head = lines[0].replace(/^﻿/, "").split(",").map((h) => h.trim());
+  return lines.slice(1).map((line) => {
+    const parts = line.split(","), row = {};
+    head.forEach((h, i) => {
+      const v = (parts[i] ?? "").trim();
+      row[h] = v === "" ? null : Number.isFinite(Number(v)) ? Number(v) : v;
+    });
+    return row;
+  });
 }
 
 // Cell id for a GPS point: the cell whose center is closest.
@@ -201,5 +234,5 @@ function nearestCell(rows, lon, lat) {
 
 module.exports = {
   GRID, LAND_NAMES, toblerSpeed, buildEdges, edgesFromWeights,
-  travelTimes, predict, nearestCell,
+  travelTimes, predict, nearestCell, readCsv,
 };
