@@ -1,0 +1,8 @@
+{
+  "name": "matoaka-terrain",
+  "version": "1.0.0",
+  "main": "terrain.js",
+  "dependencies": {
+    "papaparse": "^5.4.1"
+  }
+}
