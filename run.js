@@ -23,7 +23,15 @@ const T = require("./terrain.js");
 const { GRID } = T;
 const LAND = { 1: "Water", 2: "Trees", 7: "Built area", 11: "Rangeland", 12: "Shallow water" };
 const MAP_TIMES = [15, 30, 60, 120];   // minutes shown as buttons on the map page
-const WANDER_SCALE = 3;                // see predict() in terrain.js; a placeholder to tune
+// Movement models (see predict() in terrain.js). Both are starting
+// assumptions to tune against real tracks.
+//   "walkAway": they keep walking; likeliest places form a band.
+//   "wander":   they meander and stop; likeliest near the start.
+// MODEL is used for the CSV and PNG and opens first on the map page;
+// the map page has a switch for both.
+const MODEL = "walkAway";
+const MODELS = { walkAway: "Walk away", wander: "Wander" };
+const WANDER_SCALE = 3;
 const REACH_MPS = 2;                   // "farthest anyone could walk", meters per second
 const FLAT_TOBLER_MPS = T.toblerSpeed(0);
 const CELL_HA = (GRID.cellM * GRID.cellM) / 10000;
@@ -166,13 +174,8 @@ const b64 = (typed) => Buffer.from(typed.buffer, typed.byteOffset, typed.byteLen
 
 // ---------- One prediction ----------
 
-function predictFor(ctx, minutes) {
-  const { edges, rows, startId, speed, land, trailNear, edgeCell } = ctx;
-  const elapsedS = minutes * 60;
-  const times = T.travelTimes(edges, startId, elapsedS, speed);
-  const scores = T.predict({ edges, rows, startId, elapsedS, times, wanderScale: WANDER_SCALE });
-  const reachTimes = T.travelTimes(edges, startId, elapsedS, REACH_MPS / FLAT_TOBLER_MPS);
-
+function summarize(ctx, scores, reachKm) {
+  const { startId, land, trailNear, edgeCell } = ctx;
   const { cols: C } = GRID, sr = Math.floor(startId / C), sc = startId % C;
   const cells = [];
   let onTrail = 0, atEdge = 0, built = 0, top = 0;
@@ -195,21 +198,40 @@ function predictFor(ctx, minutes) {
     if (!n50 && acc >= 0.5) { n50 = i + 1; s50 = byP[i].p; }
     if (!n95 && acc >= 0.95) { n95 = i + 1; s95 = byP[i].p; break; }
   }
-
-  const rel = new Uint16Array(scores.length), reach = new Uint8Array(scores.length);
-  for (let id = 0; id < scores.length; id++) {
-    rel[id] = top > 0 ? Math.round((scores[id] / top) * 65535) : 0;
-    reach[id] = Number.isFinite(reachTimes[id]) && land[id] ? 1 : 0;
-  }
+  const rel = new Uint16Array(scores.length);
+  for (let id = 0; id < scores.length; id++) rel[id] = top > 0 ? Math.round((scores[id] / top) * 65535) : 0;
   return {
-    minutes, scores, ranked: byP,
+    ranked: byP,
     page: {
-      minutes, label: minutes < 60 || minutes % 60 ? `${minutes} min` : `${minutes / 60} h`,
-      rel: b64(rel), reach: b64(reach), s50: top ? s50 / top : 0, s95: top ? s95 / top : 0,
+      rel: b64(rel), s50: top ? s50 / top : 0, s95: top ? s95 / top : 0,
       stats: {
         median: quantile(0.5), p95: quantile(0.95), ha50: n50 * CELL_HA, ha95: n95 * CELL_HA,
-        onTrail, built, atEdge, reachKm: (REACH_MPS * elapsedS) / 1000, cells: cells.length,
+        onTrail, built, atEdge, reachKm, cells: cells.length,
       },
+    },
+  };
+}
+
+function predictFor(ctx, minutes) {
+  const { edges, rows, startId, speed, land } = ctx;
+  const elapsedS = minutes * 60;
+  const times = T.travelTimes(edges, startId, elapsedS, speed);
+  const reachTimes = T.travelTimes(edges, startId, elapsedS, REACH_MPS / FLAT_TOBLER_MPS);
+  const reach = new Uint8Array(times.length);
+  for (let id = 0; id < times.length; id++) reach[id] = Number.isFinite(reachTimes[id]) && land[id] ? 1 : 0;
+  const reachKm = (REACH_MPS * elapsedS) / 1000;
+
+  const models = {}, scoresBy = {}, rankedBy = {};
+  for (const model of Object.keys(MODELS)) {
+    const scores = T.predict({ edges, rows, startId, elapsedS, times, model, wanderScale: WANDER_SCALE });
+    const s = summarize(ctx, scores, reachKm);
+    models[model] = s.page; scoresBy[model] = scores; rankedBy[model] = s.ranked;
+  }
+  return {
+    minutes, scores: scoresBy[MODEL], ranked: rankedBy[MODEL],
+    page: {
+      minutes, label: minutes < 60 || minutes % 60 ? `${minutes} min` : `${minutes / 60} h`,
+      reach: b64(reach), models, stats: models[MODEL].stats,
     },
   };
 }
@@ -233,6 +255,7 @@ function writeMap(ctx, results, selected) {
     cols: GRID.cols, rows: GRID.rows, cellM: GRID.cellM, aff: ctx.aff,
     land: b64(ctx.land), trail: b64(ctx.trail), start: ctx.startId,
     startLatLon: [ctx.lat, ctx.lon], speed: ctx.speed, wanderScale: WANDER_SCALE, reachMps: REACH_MPS,
+    model: MODEL, modelNames: MODELS,
     selected, times: results.map((r) => r.page), made: new Date().toISOString().slice(0, 16).replace("T", " "),
   };
   const html = MAP_TEMPLATE.replace("__DATA__", JSON.stringify(data).replace(/</g, "\\u003c"));
@@ -243,7 +266,7 @@ function writeMap(ctx, results, selected) {
 
 function printTop(ctx, result) {
   const s = result.page.stats;
-  console.log(`\nAfter ${result.page.label}: half the chance is within ${Math.round(s.median)} m, ` +
+  console.log(`\nAfter ${result.page.label} (${MODELS[MODEL]} model): half the chance is within ${Math.round(s.median)} m, ` +
     `95% within ${Math.round(s.p95)} m (${s.cells} cells reachable)\n`);
   console.log("Rank  Latitude   Longitude    Chance  Terrain");
   result.ranked.slice(0, 5).forEach(({ id, p }, i) => {
@@ -378,6 +401,8 @@ const MAP_TEMPLATE = String.raw`<!doctype html>
   <div class="bar">
     <span class="lbl">Time since last seen</span>
     <div class="times" id="times"></div>
+    <span class="lbl">Model</span>
+    <div class="times" id="models"></div>
     <span class="lbl">Show</span>
     <div class="toggles">
       <label><input type="checkbox" data-layer="heat" checked> Heat</label>
@@ -398,7 +423,7 @@ const MAP_TEMPLATE = String.raw`<!doctype html>
         <h2>Key</h2>
         <div class="ramp"></div>
         <div class="rampl"><span>less likely</span><span>more</span></div>
-        <div class="key"><svg class="sw" height="10"><line x1="0" y1="5" x2="26" y2="5" stroke="#fde3cf" stroke-width="2.2"/></svg>Smallest area holding 50% of the chance</div>
+        <div class="key"><svg class="sw" height="10"><line x1="0" y1="5" x2="26" y2="5" stroke="#111" stroke-width="4.5" stroke-opacity=".75"/><line x1="0" y1="5" x2="26" y2="5" stroke="#fff" stroke-width="2"/></svg>Smallest area holding 50% of the chance</div>
         <div class="key"><svg class="sw" height="10"><line x1="0" y1="5" x2="26" y2="5" stroke="#ea7832" stroke-width="1.8"/></svg>Smallest area holding 95%</div>
         <div class="key"><svg class="sw" height="10"><line x1="0" y1="5" x2="26" y2="5" stroke="#d9d6d0" stroke-width="1.4" stroke-dasharray="5 4"/></svg><span id="reachKey">Reach limit: farthest anyone could walk</span></div>
         <div class="key"><svg class="sw" height="14"><circle cx="13" cy="7" r="5" fill="#111" stroke="#fff" stroke-width="2.5"/></svg>Point last seen</div>
@@ -488,39 +513,50 @@ const MAP_TEMPLATE = String.raw`<!doctype html>
     return out;
   }
 
-  var layers = {}, current = null;
-  function build(t) {
+  var layers = {}, current = null, curIdx = 0, curModel = D.model;
+  function build(time, m) {
+    var t = time.models[m];
     var raw = u16(t.rel), rel = new Float64Array(N);
     for (var i = 0; i < N; i++) rel[i] = raw[i] / 65535;
     var smooth = blur(rel), heat = L.layerGroup();
-    HEAT_STEPS.forEach(function (th, k) {
+    // Faintest band starts at the 95% line, then steps up toward the peak.
+    var lo = Math.max(t.s95, 0.001), hi = 0.85, n = HEAT_STEPS.length - 1;
+    var steps = HEAT_STEPS.map(function (_, k) { return lo * Math.pow(hi / lo, k / n); });
+    steps.forEach(function (th, k) {
       L.polygon(contour(smooth, th), { pane: "heat", stroke: false, fillColor: heatColor(k),
         fillOpacity: 0.2 + 0.08 * k, interactive: false }).addTo(heat);
     });
-    var reach = bytes(t.reach), reachVals = new Float64Array(N);
+    var reach = bytes(time.reach), reachVals = new Float64Array(N);
     for (var j = 0; j < N; j++) reachVals[j] = reach[j];
     return {
       heat: heat,
       a95: L.polygon(contour(rel, t.s95), { pane: "lines", color: "#ea7832", weight: 1.8, fill: false, interactive: false }),
-      a50: L.polygon(contour(rel, t.s50), { pane: "lines", color: "#fde3cf", weight: 2.2, fill: false, interactive: false }),
+      a50: (function () {
+        var ll = contour(rel, t.s50), g = L.layerGroup();
+        L.polygon(ll, { pane: "lines", color: "#111", weight: 4.5, opacity: 0.75, fill: false, interactive: false }).addTo(g);
+        L.polygon(ll, { pane: "lines", color: "#fff", weight: 2, fill: false, interactive: false }).addTo(g);
+        return g;
+      })(),
       reach: L.polygon(contour(reachVals, 0.5), { pane: "lines", color: "#d9d6d0", weight: 1.4, dashArray: "6 5", fill: false, interactive: false })
     };
   }
 
   function fmtM(m) { return m >= 1000 ? (m / 1000).toFixed(2) + " km" : Math.round(m) + " m"; }
   function pct(x) { return Math.round(x * 100) + "%"; }
-  function show(idx) {
-    var t = D.times[idx];
-    if (!layers[idx]) layers[idx] = build(t);
+  function show(idx, m) {
+    var time = D.times[idx], t = time.models[m], key = idx + "|" + m;
+    if (!layers[key]) layers[key] = build(time, m);
     if (current !== null) Object.keys(layers[current]).forEach(function (k) { map.removeLayer(layers[current][k]); });
-    current = idx;
+    current = key; curIdx = idx; curModel = m;
     document.querySelectorAll("[data-layer]").forEach(function (box) {
       var k = box.getAttribute("data-layer");
-      if (k !== "trails" && box.checked) layers[idx][k].addTo(map);
+      if (k !== "trails" && box.checked) layers[key][k].addTo(map);
     });
     document.querySelectorAll("#times button").forEach(function (b, i) { b.setAttribute("aria-pressed", i === idx ? "true" : "false"); });
+    document.querySelectorAll("#models button").forEach(function (b) { b.setAttribute("aria-pressed", b.getAttribute("data-model") === m ? "true" : "false"); });
+    setNote();
     var s = t.stats;
-    document.getElementById("title").textContent = "After " + t.label.replace(" min", " minutes").replace(/ h$/, t.minutes === 60 ? " hour" : " hours");
+    document.getElementById("title").textContent = "After " + time.label.replace(" min", " minutes").replace(/ h$/, time.minutes === 60 ? " hour" : " hours");
     var rowsHtml = [
       ["Median distance from last seen", fmtM(s.median)],
       ["95th percentile distance", fmtM(s.p95)],
@@ -538,8 +574,15 @@ const MAP_TEMPLATE = String.raw`<!doctype html>
   D.times.forEach(function (t, i) {
     var b = document.createElement("button");
     b.type = "button"; b.textContent = t.label;
-    b.addEventListener("click", function () { show(i); });
+    b.addEventListener("click", function () { show(i, curModel); });
     bar.appendChild(b);
+  });
+  var mbar = document.getElementById("models");
+  Object.keys(D.modelNames).forEach(function (m) {
+    var b = document.createElement("button");
+    b.type = "button"; b.textContent = D.modelNames[m]; b.setAttribute("data-model", m);
+    b.addEventListener("click", function () { show(curIdx, m); });
+    mbar.appendChild(b);
   });
   document.querySelectorAll("[data-layer]").forEach(function (box) {
     box.addEventListener("change", function () {
@@ -549,11 +592,15 @@ const MAP_TEMPLATE = String.raw`<!doctype html>
     });
   });
   document.getElementById("reachKey").textContent = "Reach limit: farthest anyone could walk (" + D.reachMps + " m/s, around water)";
-  document.getElementById("model").textContent = "Last seen at " + D.startLatLon[0].toFixed(5) + ", " + D.startLatLon[1].toFixed(5) +
-    ". Walking speed x" + D.speed + ". Wandering model, scale " + D.wanderScale +
-    ": a starting assumption, not yet tuned to real tracks. Made " + D.made + ".";
+  function setNote() {
+    var how = curModel === "wander"
+      ? "Wander model (scale " + D.wanderScale + "): they meander and stop, so the likeliest cells are near the start."
+      : "Walk away model: they keep walking, so the likeliest places form a band at about 70% of how far they could have gone.";
+    document.getElementById("model").textContent = "Last seen at " + D.startLatLon[0].toFixed(5) + ", " + D.startLatLon[1].toFixed(5) +
+      ". Walking speed x" + D.speed + ". " + how + " Both are starting assumptions, not yet tuned to real tracks. Made " + D.made + ".";
+  }
   var sel = D.times.findIndex(function (t) { return t.minutes === D.selected; });
-  show(sel < 0 ? 0 : sel);
+  show(sel < 0 ? 0 : sel, D.model);
   // Open zoomed to the likely area (with room around it), not the whole grid.
   map.fitBounds(layers[current].a95.getBounds().extend(startLL).pad(0.35));
 })();
